@@ -1,5 +1,5 @@
 Driver,DriverNumber,LapTime,LapNumber,Stint,Sector1Time,Sector2Time,Sector3Time,Compound,TyreLife,Team,Position
-0,VER,1,00:01:27.458,1.0,1.0,,18.462,35.518,MEDIUM,1.0,Red Bull Racing,1.0,
+0,VER,1, 00:01:27.458,1.0,1.0,,18.462,35.518,MEDIUM,1.0,Red Bull Racing,1.0
 1,VER,1, 00:01:24.099,2.0,1.0,29.623,18.375,36.101,MEDIUM,2.0,Red Bull Racing,2.0
 2,VER,1, 00:01:23.115,3.0,1.0,28.793,18.573,35.749,MEDIUM,3.0,Red Bull Racing,2.0
 3,VER,1, 00:01:23.115,4.0,1.0,28.756,18.353,,MEDIUM,4.0,Red Bull Racing,19.0
