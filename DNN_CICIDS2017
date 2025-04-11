@@ -1,0 +1,247 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import classification_report, confusion_matrix
+from imblearn.over_sampling import SMOTE
+import tensorflow as tf
+from tensorflow.keras import layers, models
+import tensorflow_model_optimization as tfmot
+import os
+import glob
+
+# Configurar para evitar errores de memoria en GPU (si aplica)
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+
+# 1. Cargar y preprocesar el dataset CICIDS2017
+def load_cicids2017(data_dir='./CICIDS2017/'):
+    # Buscar todos los CSVs en el directorio
+    csv_files = glob.glob(os.path.join(data_dir, '*.csv'))
+    if not csv_files:
+        raise FileNotFoundError("No se encontraron archivos CSV en el directorio especificado.")
+    
+    # Cargar y concatenar todos los CSVs
+    dfs = [pd.read_csv(f, encoding='utf-8', low_memory=False) for f in csv_files]
+    data = pd.concat(dfs, ignore_index=True)
+    
+    # Limpiar nombres de columnas (algunas tienen espacios)
+    data.columns = data.columns.str.strip()
+    
+    # Manejar valores infinitos y NaN
+    data.replace([np.inf, -np.inf], np.nan, inplace=True)
+    data.dropna(inplace=True)
+    
+    # Separar características y etiquetas
+    X = data.drop('Label', axis=1)
+    y = data['Label']
+    
+    return X, y
+
+def preprocess_data(X, y):
+    # Codificar etiquetas
+    label_encoder = LabelEncoder()
+    y_encoded = label_encoder.fit_transform(y)
+    
+    # Guardar mapeo de clases
+    class_mapping = dict(zip(label_encoder.classes_, range(len(label_encoder.classes_))))
+    print("Mapeo de clases:", class_mapping)
+    
+    # Escalar características
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # Dividir en train/test
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
+    )
+    
+    # Aplicar SMOTE para balancear clases en el conjunto de entrenamiento
+    smote = SMOTE(random_state=42)
+    X_train_bal, y_train_bal = smote.fit_resample(X_train, y_train)
+    
+    return X_train_bal, X_test, y_train_bal, y_test, label_encoder
+
+# 2. Definir el modelo DNN base
+def create_dnn_model(input_dim, num_classes):
+    model = models.Sequential([
+        layers.Dense(128, activation='relu', input_shape=(input_dim,)),
+        layers.Dropout(0.3),
+        layers.Dense(64, activation='relu'),
+        layers.Dropout(0.3),
+        layers.Dense(32, activation='relu'),
+        layers.Dense(num_classes, activation='softmax')
+    ])
+    model.compile(
+        optimizer='adam',
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    return model
+
+# 3. Definir modelo profesor para Knowledge Distillation
+def create_teacher_model(input_dim, num_classes):
+    model = models.Sequential([
+        layers.Dense(256, activation='relu', input_shape=(input_dim,)),
+        layers.Dropout(0.4),
+        layers.Dense(128, activation='relu'),
+        layers.Dropout(0.4),
+        layers.Dense(64, activation='relu'),
+        layers.Dropout(0.4),
+        layers.Dense(32, activation='relu'),
+        layers.Dense(num_classes, activation='softmax')
+    ])
+    model.compile(
+        optimizer='adam',
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    return model
+
+# 4. Clase para Knowledge Distillation
+class DistillationModel(tf.keras.Model):
+    def __init__(self, student, teacher, alpha=0.1, temperature=3.0):
+        super(DistillationModel, self).__init__()
+        self.student = student
+        self.teacher = teacher
+        self.alpha = alpha
+        self.temperature = temperature
+
+    def compile(self, optimizer, metrics, student_loss_fn, distillation_loss_fn):
+        super(DistillationModel, self).compile(optimizer=optimizer, metrics=metrics)
+        self.student_loss_fn = student_loss_fn
+        self.distillation_loss_fn = distillation_loss_fn
+
+    def train_step(self, data):
+        x, y = data
+        teacher_predictions = self.teacher(x, training=False)
+        
+        with tf.GradientTape() as tape:
+            student_predictions = self.student(x, training=True)
+            student_loss = self.student_loss_fn(y, student_predictions)
+            distillation_loss = self.distillation_loss_fn(
+                tf.nn.softmax(teacher_predictions / self.temperature, axis=1),
+                tf.nn.softmax(student_predictions / self.temperature, axis=1)
+            )
+            total_loss = self.alpha * student_loss + (1 - self.alpha) * distillation_loss
+        
+        trainable_vars = self.student.trainable_variables
+        gradients = tape.gradient(total_loss, trainable_vars)
+        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
+        
+        self.compiled_metrics.update_state(y, student_predictions)
+        return {m.name: m.result() for m in self.metrics}
+
+# 5. Entrenar y evaluar modelo
+def train_and_evaluate(model, X_train, y_train, X_test, y_test, model_name, epochs=10, batch_size=64):
+    history = model.fit(
+        X_train, y_train,
+        validation_split=0.2,
+        epochs=epochs,
+        batch_size=batch_size,
+        verbose=1
+    )
+    
+    # Evaluar
+    test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
+    print(f"\n{model_name} - Test Accuracy: {test_acc:.4f}, Test Loss: {test_loss:.4f}")
+    
+    # Predicciones detalladas
+    y_pred = np.argmax(model.predict(X_test), axis=1)
+    print(f"\nClassification Report - {model_name}:")
+    print(classification_report(y_test, y_pred, target_names=label_encoder.classes_))
+    
+    return history
+
+# 6. Aplicar QAT
+def apply_qat(model):
+    qat_model = tfmot.quantization.keras.quantize_model(model)
+    qat_model.compile(
+        optimizer='adam',
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    return qat_model
+
+# Main
+if __name__ == "__main__":
+    # Cargar datos
+    print("Cargando dataset CICIDS2017...")
+    X, y = load_cicids2017(data_dir='./CICIDS2017/')
+    
+    # Preprocesar
+    print("Preprocesando datos...")
+    X_train, X_test, y_train, y_test, label_encoder = preprocess_data(X, y)
+    input_dim = X_train.shape[1]
+    num_classes = len(label_encoder.classes_)
+    print(f"Dimensiones de entrada: {input_dim}, Número de clases: {num_classes}")
+    
+    # 7. Entrenar modelo base
+    print("\nEntrenando modelo base...")
+    base_model = create_dnn_model(input_dim, num_classes)
+    base_history = train_and_evaluate(
+        base_model, X_train, y_train, X_test, y_test, "Modelo Base"
+    )
+    
+    # Guardar tamaño del modelo base
+    base_model.save('base_model.h5')
+    base_size = os.path.getsize('base_model.h5') / (1024 * 1024)  # MB
+    print(f"Tamaño del modelo base: {base_size:.2f} MB")
+    
+    # 8. Entrenar modelo con QAT
+    print("\nEntrenando modelo con QAT...")
+    qat_model = apply_qat(base_model)
+    qat_history = train_and_evaluate(
+        qat_model, X_train, y_train, X_test, y_test, "Modelo QAT"
+    )
+    
+    # Convertir a TFLite para medir tamaño
+    converter = tf.lite.TFLiteConverter.from_keras_model(qat_model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    tflite_model = converter.convert()
+    with open('qat_model.tflite', 'wb') as f:
+        f.write(tflite_model)
+    qat_size = os.path.getsize('qat_model.tflite') / (1024 * 1024)  # MB
+    print(f"Tamaño del modelo QAT: {qat_size:.2f} MB")
+    
+    # 9. Entrenar modelo con Knowledge Distillation
+    print("\nEntrenando modelo profesor...")
+    teacher_model = create_teacher_model(input_dim, num_classes)
+    teacher_model.fit(
+        X_train, y_train,
+        validation_split=0.2,
+        epochs=10,
+        batch_size=64,
+        verbose=1
+    )
+    
+    print("\nAplicando Knowledge Distillation...")
+    student_model = create_dnn_model(input_dim, num_classes)
+    distiller = DistillationModel(
+        student=student_model,
+        teacher=teacher_model,
+        alpha=0.1,
+        temperature=3.0
+    )
+    distiller.compile(
+        optimizer=tf.keras.optimizers.Adam(),
+        metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
+        student_loss_fn=tf.keras.losses.SparseCategoricalCrossentropy(),
+        distillation_loss_fn=tf.keras.losses.KLDivergence()
+    )
+    distillation_history = train_and_evaluate(
+        distiller, X_train, y_train, X_test, y_test, "Modelo Destilado"
+    )
+    
+    # Guardar tamaño del modelo destilado
+    student_model.save('student_model.h5')
+    student_size = os.path.getsize('student_model.h5') / (1024 * 1024)  # MB
+    print(f"Tamaño del modelo destilado: {student_size:.2f} MB")
+    
+    # 10. Resumen de resultados
+    print("\nResumen de tamaños:")
+    print(f"Modelo Base: {base_size:.2f} MB")
+    print(f"Modelo QAT: {qat_size:.2f} MB")
+    print(f"Modelo Destilado: {student_size:.2f} MB")
